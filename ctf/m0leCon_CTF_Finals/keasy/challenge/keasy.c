@@ -23,10 +23,15 @@ const struct file_operations keasy_file_fops = {
 	.read = keasy_file_read
 };
 
+// 是否启动enabled
 unsigned enabled = 1;
 
 static long keasy_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
+	// EINVAL是Linux内核中的一个错误代码，代表"Invalid argument"，即"无效的参数"。
+	// 当系统调用或函数接收到一个无效或不合法的参数时，会返回EINVAL错误代码。
 	long ret = -EINVAL;
+
+
 	struct file *myfile;
 	int fd;
 
@@ -34,17 +39,35 @@ static long keasy_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) 
 		goto out;
 	}
 	enabled = 0;
-
+	/*
+	anon_inode_getfile函数是Linux内核中的一个函数，它负责创建一个匿名inode并将其与一个文件结构关联起来。
+	这个函数主要用于在内核中创建没有对应磁盘文件的文件对象。
+	当一个进程调用某些系统调用（如pipe或eventfd）需要创建一个没有对应磁盘文件的类似文件的对象时，
+	就会调用anon_inode_getfile函数。它创建一个匿名inode并返回与之关联的文件对象。
+	下面是anon_inode_getfile执行的大致步骤：
+	该函数首先检查传递给它的struct file对象是否已经关联了一个inode。
+	如果是，则返回错误，因为该函数仅用于创建匿名inode。
+	然后，它分配一个新的struct inode对象，并将其设置为匿名inode。
+	匿名inode是一个没有对应磁盘文件的inode。它用于表示各种内核特定的对象，例如管道或事件文件描述符。
+	接下来，函数分配一个新的struct file对象，并用上一步创建的匿名inode进行初始化。
+	函数使用适当的文件操作结构设置文件对象的f_op字段，该结构包含处理特定于正在创建的对象类型的文件相关操作的函数指针。
+	最后，函数将新创建的文件对象返回给调用者。
+	*/
     myfile = anon_inode_getfile("[easy]", &keasy_file_fops, NULL, 0);
 
+	// 获取一样未使用的fd
     fd = get_unused_fd_flags(O_CLOEXEC);
     if (fd < 0) {
         ret = fd;
         goto err;
     }
 
+	// 将fd安装到myfile
     fd_install(fd, myfile);
 
+	// copy_to_user()是一种用于将内核空间中的数据复制到用户空间的函数。 它的返回值类型是unsigned long，
+	// 通常用于指示复制的数据长度或者错误码。 
+	// 当copy_to_user()函数成功复制了全部或部分数据到用户空间时，它会返回0。
 	if (copy_to_user((unsigned int __user *)arg, &fd, sizeof(fd))) {
 		ret = -EINVAL;
 		goto err;
@@ -110,9 +133,17 @@ static void __exit keasy_exit(void) {
 	unregister_chrdev_region(MKDEV(cinfo.major, 0), 1);
 }
 
+// 内核模块初始化
 module_init(keasy_init);
+
+// 内核模块退出
 module_exit(keasy_exit);
 
+// 内核模块作者
 MODULE_AUTHOR("bros");
+
+// 内核模块协议
 MODULE_LICENSE("GPL");
+
+// 内核模块描述
 MODULE_DESCRIPTION("Easiest kernel chall of ur life");
