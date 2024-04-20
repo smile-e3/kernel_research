@@ -8,7 +8,7 @@ qemu-system-x86_64 \
     -cpu qemu64 \
     -smp 1 \
     -monitor /dev/null \
-    -initrd rootfs_updated.cpio \
+    -initrd "$1" \
     -net nic,model=virtio \
     -net user \
     -gdb tcp::12345
